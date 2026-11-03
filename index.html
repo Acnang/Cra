@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#3b9ce6">
+  <title>Bubble Grid Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Jua&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="sky"></div>
+
+<main id="app">
+
+  <!-- ============ 1. 타이틀 ============ -->
+  <section id="screen-title" class="screen active">
+    <h1 class="logo" aria-label="Bubble Grid Game">
+      <span class="logo-line l1"><i>B</i><i>u</i><i>b</i><i>b</i><i>l</i><i>e</i></span>
+      <span class="logo-line l2"><i>G</i><i>r</i><i>i</i><i>d</i></span>
+      <span class="logo-sub">물풍선 팀 대전</span>
+    </h1>
+
+    <div class="win title-win">
+      <div class="titlebar">로그인</div>
+      <div class="win-body">
+        <label class="field-row">
+          <span class="field-label">닉네임</span>
+          <input id="nick" class="text-input" type="text" maxlength="10" placeholder="10자 이내" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="field-row top">
+          <span class="field-label">캐릭터</span>
+          <div id="skin-picker" class="skin-picker" role="radiogroup" aria-label="캐릭터 선택"></div>
+        </div>
+        <div class="btn-row">
+          <button id="btn-online" class="btn big" type="button">온라인 게임</button>
+          <button id="btn-practice" class="btn big blue" type="button">연습 게임</button>
+        </div>
+        <p class="hint">온라인 게임은 서버를 골라 1:1, 2:2, 3:3 팀 대전을 매칭합니다.<br>연습 게임은 서버 없이 봇과 바로 대전합니다.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 2. 서버 선택 ============ -->
+  <section id="screen-servers" class="screen">
+    <div class="win servers-win">
+      <div class="titlebar"><span>서버 선택</span><button id="btn-servers-refresh" class="btn small gray" type="button">새로고침</button></div>
+      <div class="win-body">
+        <p class="hint left">인원이 몰리지 않도록 서버가 나뉘어 있습니다. 한산한 서버를 고르면 매칭이 더 쾌적합니다.</p>
+        <ul id="server-list" class="server-list"></ul>
+        <div class="btn-row end">
+          <button id="btn-servers-back" class="btn gray" type="button">뒤로</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 3. 로비 ============ -->
+  <section id="screen-lobby" class="screen">
+    <div class="win lobby-win">
+      <div class="titlebar">
+        <span id="lobby-title">서버 1</span>
+        <button id="btn-lobby-leave" class="btn small gray" type="button">서버 선택</button>
+      </div>
+      <div class="lobby-grid">
+        <div class="lobby-main">
+          <div class="panel-title">대전 방식</div>
+          <div id="mode-cards" class="mode-cards" role="radiogroup" aria-label="대전 방식"></div>
+          <div class="btn-row">
+            <button id="btn-match" class="btn huge" type="button">게임 시작</button>
+          </div>
+          <div class="btn-row">
+            <button id="btn-lobby-practice" class="btn small blue" type="button">연습 게임 (봇)</button>
+          </div>
+          <div class="me-card">
+            <canvas id="me-avatar" width="64" height="64"></canvas>
+            <div>
+              <div id="me-name" class="me-name"></div>
+              <div id="me-sub" class="me-sub"></div>
+            </div>
+          </div>
+        </div>
+        <aside class="lobby-side">
+          <div class="panel-title">접속자 <span id="online-count" class="count">0</span></div>
+          <ul id="player-list" class="player-list"></ul>
+        </aside>
+      </div>
+      <div class="chat">
+        <div id="chat-log" class="chat-log" aria-live="polite"></div>
+        <form id="chat-form" class="chat-form" autocomplete="off">
+          <input id="chat-input" class="text-input" type="text" maxlength="60" placeholder="채팅 입력 후 Enter" spellcheck="false">
+          <button class="btn small" type="submit">전송</button>
+        </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 4. 게임 ============ -->
+  <section id="screen-game" class="screen">
+    <div class="game-wrap">
+      <div class="stage">
+        <canvas id="game" aria-label="게임 화면"></canvas>
+        <div id="banner" class="banner hidden"><div id="banner-main" class="banner-main"></div><div id="banner-sub" class="banner-sub"></div></div>
+      </div>
+
+      <aside class="side">
+        <div class="side-top">
+          <div class="side-box timer-box">
+            <div class="side-label">남은 시간</div>
+            <div id="timer" class="timer">2:30</div>
+            <div id="round-label" class="round-label">ROUND 1</div>
+          </div>
+          <div id="scoreboard" class="scoreboard"></div>
+        </div>
+        <ul id="slots" class="slots"></ul>
+        <div class="side-box">
+          <div class="side-label">내 능력치</div>
+          <div id="mystats" class="mystats"></div>
+        </div>
+        <div class="side-actions">
+          <button id="btn-pad" class="btn small blue" type="button">패드</button>
+          <button id="btn-mute" class="btn small gray" type="button">소리 켬</button>
+          <button id="btn-exit" class="btn small red" type="button">나가기</button>
+        </div>
+      </aside>
+    </div>
+
+    <section id="joypad" class="joypad" aria-label="가상 조이패드">
+      <div id="dpad" class="dpad">
+        <span data-dir="up"></span><span data-dir="left"></span><span data-dir="right"></span><span data-dir="down"></span>
+      </div>
+      <button id="bomb-btn" class="bomb-btn" type="button" aria-label="물풍선 놓기"><span>물풍선</span></button>
+    </section>
+
+    <p class="keys-help">이동 방향키 / WASD &nbsp;·&nbsp; 물풍선 Space / Enter &nbsp;·&nbsp; 갇힌 팀원에게 닿으면 구출, 갇힌 상대에게 닿으면 처치</p>
+
+    <div id="result" class="modal hidden">
+      <div class="win result-win">
+        <div id="result-title" class="result-title"></div>
+        <div id="result-sub" class="result-sub"></div>
+        <table id="result-table" class="result-table"></table>
+        <div class="btn-row">
+          <button id="btn-rematch" class="btn blue hidden" type="button">다시 하기</button>
+          <button id="btn-result-exit" class="btn" type="button">로비로</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ============ 매칭중 ============ -->
+<div id="matching" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="matching-title">
+  <div class="win match-win">
+    <div class="titlebar">자동 매칭</div>
+    <div class="win-body center">
+      <div class="bubbles" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <div id="matching-title" class="matching-title">매칭중<span class="dots"><b>.</b><b>.</b><b>.</b></span></div>
+      <div id="matching-mode" class="matching-mode">1 : 1</div>
+      <div class="matching-info">대기 인원 <b id="matching-count">1 / 2</b> &nbsp;·&nbsp; 대기 시간 <b id="matching-time">0:00</b></div>
+      <p id="matching-hint" class="hint">같은 서버에서 대전할 상대를 찾고 있습니다.</p>
+      <div class="btn-row">
+        <button id="btn-fillbots" class="btn blue hidden" type="button">봇과 함께 시작</button>
+        <button id="btn-cancel-match" class="btn gray" type="button">취소</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 알림창 ============ -->
+<div id="dialog" class="modal hidden" role="alertdialog" aria-modal="true">
+  <div class="win dialog-win">
+    <div class="titlebar">알림</div>
+    <div class="win-body center">
+      <p id="dialog-msg" class="dialog-msg"></p>
+      <div class="btn-row">
+        <button id="dialog-ok" class="btn" type="button">확인</button>
+        <button id="dialog-cancel" class="btn gray hidden" type="button">취소</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="config.js"></script>
+<script src="core.js"></script>
+<script src="client.js"></script>
+</body>
+</html>

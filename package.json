@@ -1,0 +1,15 @@
+{
+  "name": "bubble-grid-game",
+  "version": "1.0.0",
+  "description": "Bubble Grid Game - 물풍선 격자 팀 대전 (1:1, 2:2, 3:3) 온라인 미니 게임 + 데디케이트 서버",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke-online.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "private": true
+}
