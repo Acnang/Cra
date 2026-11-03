@@ -181,7 +181,7 @@ class Renderer {
     canvas.height = CONFIG.ROWS * S;
   }
 
-  draw(core, time, myPid) {
+  draw(core, time, myPid, ghosts) {
     const ctx = this.ctx, { COLS, ROWS } = CONFIG;
     ctx.clearRect(0, 0, this.cv.width, this.cv.height);
     for (let y = 0; y < ROWS; y++) {
@@ -199,6 +199,7 @@ class Renderer {
       }
     }
     for (const b of core.bombs) this.drawBomb(b, time);
+    if (ghosts) for (const g of ghosts) this.drawBomb({ x: g.x, y: g.y, timer: CONFIG.FUSE_MS }, time);
     for (const f of core.flames) this.drawFlame(f);
     const order = core.players.filter(p => p.alive).sort((a, b) => (a.py + (a.y - a.py) * 0.5) - (b.py + (b.y - b.py) * 0.5));
     for (const p of order) this.drawPlayer(p, time, core, p.id === myPid);
@@ -401,44 +402,99 @@ class Keys {
   reset() { if (this.stack.length) { this.stack = []; this.emit(); } }
 }
 
+/** 가상 조이스틱 + 물풍선 버튼.
+ *  - 스틱과 버튼은 각자 다른 손가락(pointerId)으로 추적해서 이동하면서 동시에 공격할 수 있음
+ *  - 손잡이가 손가락을 따라 움직이고, 데드존/축 고정(히스테리시스)으로 대각선에서 방향이 떨리지 않음
+ *  - 가려는 방향이 벽이면 손가락이 기운 쪽의 다른 방향으로 미끄러져 모서리를 부드럽게 돌아감 */
 class TouchPad {
-  constructor(dpad, bombBtn, onDir, onBomb, onGesture) {
+  constructor({ stick, knob, bombBtn, onDir, onBomb, onGesture, isBlocked }) {
+    this.stick = stick; this.knob = knob; this.bombBtn = bombBtn;
+    this.onDir = onDir;
+    this.isBlocked = isBlocked || (() => false);
     this.dir = null;
-    let activeId = null;
-    const calc = e => {
-      const r = dpad.getBoundingClientRect();
-      const dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
-      if (Math.hypot(dx, dy) < r.width * 0.15) return null;
-      return Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
-    };
-    this.setDir = d => {
-      if (d === this.dir) return;
-      this.dir = d;
-      dpad.querySelectorAll('[data-dir]').forEach(el => el.classList.toggle('on', el.dataset.dir === d));
-      onDir(d);
-    };
-    dpad.addEventListener('pointerdown', e => {
-      e.preventDefault(); onGesture(); activeId = e.pointerId;
-      try { dpad.setPointerCapture(e.pointerId); } catch { /* 일부 브라우저는 캡처 불가 */ }
-      this.setDir(calc(e));
+    this.axis = null;
+    this.vec = { x: 0, y: 0 };
+    this.stickId = null;
+    this.bombIds = new Set();
+    this.rect = null;
+
+    stick.addEventListener('pointerdown', e => {
+      if (this.stickId !== null) return;
+      e.preventDefault(); onGesture();
+      this.stickId = e.pointerId;
+      this.rect = stick.getBoundingClientRect();
+      this.moveTo(e);
     });
-    dpad.addEventListener('pointermove', e => { if (e.pointerId === activeId) this.setDir(calc(e)); });
-    const end = e => { if (e.pointerId === activeId) { activeId = null; this.setDir(null); } };
-    dpad.addEventListener('pointerup', end);
-    dpad.addEventListener('pointercancel', end);
-    dpad.addEventListener('lostpointercapture', end);
     bombBtn.addEventListener('pointerdown', e => {
-      e.preventDefault(); onGesture(); bombBtn.classList.add('on');
-      if (navigator.vibrate) navigator.vibrate(12);
+      e.preventDefault(); onGesture();
+      this.bombIds.add(e.pointerId);
+      bombBtn.classList.add('on');
+      if (navigator.vibrate) navigator.vibrate(10);
       onBomb();
     });
-    const up = () => bombBtn.classList.remove('on');
-    bombBtn.addEventListener('pointerup', up);
-    bombBtn.addEventListener('pointercancel', up);
-    bombBtn.addEventListener('pointerleave', up);
-    for (const el of [dpad, bombBtn]) el.addEventListener('contextmenu', e => e.preventDefault());
+    // 이동/종료는 window 에서 받아서 손가락이 버튼 밖으로 나가도 끊기지 않게 함
+    window.addEventListener('pointermove', e => { if (e.pointerId === this.stickId) this.moveTo(e); });
+    const end = e => {
+      if (e.pointerId === this.stickId) { this.stickId = null; this.release(); }
+      if (this.bombIds.delete(e.pointerId) && !this.bombIds.size) bombBtn.classList.remove('on');
+    };
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+    for (const el of [stick, bombBtn]) el.addEventListener('contextmenu', e => e.preventDefault());
   }
-  reset() { this.setDir(null); }
+
+  moveTo(e) {
+    const r = this.rect, R = r.width / 2;
+    const dx = (e.clientX - (r.left + R)) / R, dy = (e.clientY - (r.top + r.height / 2)) / R;
+    this.vec = { x: dx, y: dy };
+    const len = Math.hypot(dx, dy), k = len > 1 ? 1 / len : 1, travel = R * 0.52;
+    this.knob.style.transform = `translate(${dx * k * travel}px, ${dy * k * travel}px)`;
+    this.apply();
+  }
+
+  apply() {
+    const { x, y } = this.vec;
+    const len = Math.hypot(x, y);
+    let dir = null;
+    if (len >= 0.2) {                                   // 데드존
+      const ax = Math.abs(x), ay = Math.abs(y);
+      if (this.axis === 'x' && ay > ax * 1.35) this.axis = 'y';     // 축을 바꾸려면 확실히 기울여야 함
+      else if (this.axis === 'y' && ax > ay * 1.35) this.axis = 'x';
+      else if (!this.axis) this.axis = ax >= ay ? 'x' : 'y';
+      const hx = x > 0 ? 'right' : 'left', hy = y > 0 ? 'down' : 'up';
+      const primary = this.axis === 'x' ? hx : hy, secondary = this.axis === 'x' ? hy : hx;
+      const secMag = this.axis === 'x' ? ay : ax;
+      dir = primary;
+      if (this.isBlocked(primary) && secMag > len * 0.3 && !this.isBlocked(secondary)) dir = secondary;   // 벽 슬라이드
+    } else {
+      this.axis = null;
+    }
+    this.setDir(dir);
+  }
+
+  setDir(d) {
+    if (d === this.dir) return;
+    this.dir = d;
+    this.stick.querySelectorAll('.arr').forEach(el => el.classList.toggle('on', el.dataset.dir === d));
+    this.onDir(d);
+  }
+
+  /** 매 프레임: 손가락은 그대로여도 주변 지형이 바뀌면(막힘/뚫림) 방향을 다시 계산 */
+  tick() { if (this.stickId !== null) this.apply(); }
+
+  release() {
+    this.vec = { x: 0, y: 0 };
+    this.axis = null;
+    this.knob.style.transform = 'translate(0, 0)';
+    this.setDir(null);
+  }
+
+  reset() {
+    this.stickId = null;
+    this.bombIds.clear();
+    this.bombBtn.classList.remove('on');
+    this.release();
+  }
 }
 
 /* ============================================================================
@@ -446,28 +502,148 @@ class TouchPad {
  *      core, myPid, update(dt), sendDir(dir), sendBomb(), close()
  * ========================================================================== */
 class OnlineSession {
-  constructor(net, start) {
+  /** start: 'start'(전용 서버 방식) 또는 'hstart'(방장 방식) 메시지 */
+  constructor(app, start) {
+    this.app = app;
+    this.net = app.net;
     this.online = true;
-    this.net = net;
     this.mode = start.mode;
     this.myPid = start.you;
-    this.core = new GameCore({ seed: start.seed, players: start.players, winsToMatch: start.winsToMatch, onEvent: () => {} });
+    this.relay = start.hostPid !== undefined;        // true = 방장 방식, false = 전용 서버 방식
+    this.hostPid = this.relay ? start.hostPid : -1;
+    this.isHost = false;
+    this.defs = start.players;
+    this.bots = [];
+    this.events = [];
+    this.lastGrid = null;
+    this.lastSend = 0;
+    this.overAt = 0;
+    this.endSent = false;
     this.lastDir = null;
-    this.onEvent = () => {};
+    this.ghosts = [];
+    this.aheadSince = 0;
+    this.core = new GameCore({
+      seed: start.seed, players: start.players, winsToMatch: start.winsToMatch,
+      onEvent: e => { if (this.isHost) { this.events.push(e); this.app.onEvent(e); } },
+    });
+    if (this.relay && start.hostPid === start.you) this.becomeHost(start.bots || []);
   }
-  handleSnapshot(msg) {
-    this.core.applySnapshot(msg.s);
-    for (const e of msg.ev) this.onEvent(e);
+
+  /* ----- 방장 ----- */
+  becomeHost(botPids) {
+    this.isHost = true;
+    this.hostPid = this.myPid;
+    this.lastGrid = null;
+    this.events = [];
+    this.overAt = 0;
+    this.endSent = false;
+    this.setBots(botPids);
   }
-  update(dt) { this.core.update(dt); }
-  sendDir(dir) { if (dir !== this.lastDir) { this.lastDir = dir; this.net.send({ t: 'in', dir }); } }
-  sendBomb() { this.net.send({ t: 'bomb' }); }
-  close() { this.net.send({ t: 'leave' }); }
+  setBots(pids) {
+    for (const pid of pids) if (!this.bots[pid] && pid !== this.myPid && this.core.players[pid]) this.bots[pid] = new BotController(this.core, pid);
+  }
+  stopHosting() { this.isHost = false; this.bots = []; this.events = []; }
+
+  /** 서버가 보낸 메시지 처리. 처리했으면 true */
+  handle(m) {
+    switch (m.t) {
+      case 's': if (!this.isHost) this.handleSnapshot(m); return true;
+      case 'r_in': if (this.isHost && this.core.players[m.pid]) this.core.setInput(m.pid, DIR_NAMES.includes(m.dir) ? m.dir : null); return true;
+      case 'r_bomb': if (this.isHost) this.core.queueBomb(m.pid | 0); return true;
+      case 'peer_left': if (this.isHost) this.setBots([m.pid | 0]); return true;
+      case 'host_change':
+        this.hostPid = m.hostPid;
+        if (m.hostPid === this.myPid) {
+          if (!this.isHost) this.becomeHost(m.bots || []); else this.setBots(m.bots || []);
+          this.core.setInput(this.myPid, this.lastDir);
+          this.app.notice('내가 방장이 되었습니다. 게임을 이어서 진행합니다');
+        } else {
+          if (this.isHost) this.stopHosting();
+          this.app.notice(`방장이 ${m.name}님으로 바뀌었습니다`);
+        }
+        return true;
+      default: return false;
+    }
+  }
+
+  update(dt) {
+    if (!this.isHost) { this.core.update(dt); return; }
+    for (const b of this.bots) if (b) b.update(dt);
+    this.core.update(dt);
+    this.broadcast();
+    if (this.core.state === 'matchOver') {                 // 한 판이 끝나면 잠시 뒤 모두 대기방으로
+      const now = performance.now();
+      if (!this.overAt) this.overAt = now;
+      else if (!this.endSent && now - this.overAt > 7000) { this.endSent = true; this.net.send({ t: 'room_end' }); }
+    }
+  }
+
+  broadcast() {
+    const now = performance.now();
+    if (now - this.lastSend < 40) return;                   // 25Hz
+    this.lastSend = now;
+    const g = this.core.grid.join('');
+    const snap = this.core.getSnapshot(false);
+    if (g !== this.lastGrid) { snap.g = g; this.lastGrid = g; }
+    this.net.send({ t: 'hs', s: snap, ev: this.events });
+    this.events = [];
+  }
+
+  /* ----- 참가자: 서버(방장)가 보낸 상태 반영 + 내 캐릭터 예측 ----- */
+  handleSnapshot(m) {
+    const me = this.core.players[this.myPid];
+    const keep = me && { x: me.x, y: me.y, px: me.px, py: me.py, moveTimer: me.moveTimer, curDur: me.curDur, facing: me.facing };
+    this.core.applySnapshot(m.s);
+    const sp = this.core.players[this.myPid];
+    if (sp && keep) {
+      // 내 입력은 즉시 내 화면에 반영(예측)해 두었으므로, 서버 상태와 한 칸 이내로 어긋나면 내 쪽을 유지해 끊김을 없앰
+      const dist = Math.abs(keep.x - sp.x) + Math.abs(keep.y - sp.y);
+      const now = performance.now();
+      let useLocal = false;
+      if (sp.alive && !sp.trapped && this.core.state === 'playing' && this.core.freeze <= 0) {
+        if (dist === 0) { useLocal = true; this.aheadSince = 0; }
+        else if (dist === 1) { if (!this.aheadSince) this.aheadSince = now; useLocal = now - this.aheadSince < 450; }
+        else this.aheadSince = 0;
+      } else this.aheadSince = 0;
+      if (useLocal) Object.assign(sp, keep);
+      sp.input = this.lastDir;
+    }
+    for (const e of m.ev || []) this.app.onEvent(e);
+  }
+
+  sendDir(dir) {
+    if (dir === this.lastDir) return;
+    this.lastDir = dir;
+    this.core.setInput(this.myPid, dir);                    // 방장은 곧바로 반영, 참가자는 예측
+    if (!this.isHost) this.net.send({ t: 'in', dir });
+  }
+
+  sendBomb() {
+    if (this.isHost) { this.core.queueBomb(this.myPid); return; }
+    this.net.send({ t: 'bomb' });
+    const c = this.core, me = c.players[this.myPid], now = performance.now();
+    if (!me || !me.alive || me.trapped || c.state !== 'playing' || c.freeze > 0) return;
+    const pending = this.ghostBombs(now);
+    if (c.countBombs(me.id) + pending.length >= me.maxBombs) return;
+    if (c.bombAt(me.x, me.y) || pending.some(g => g.x === me.x && g.y === me.y)) return;
+    this.ghosts.push({ x: me.x, y: me.y, t: now });         // 서버 확인 전에도 물풍선이 바로 보이게
+  }
+
+  /** 아직 서버에서 확인되지 않은 내 물풍선(표시 전용) */
+  ghostBombs(now) {
+    this.ghosts = this.ghosts.filter(g => now - g.t < 450 && !this.core.bombAt(g.x, g.y));
+    return this.ghosts;
+  }
+
+  close() { this.net.send({ t: this.relay ? 'room_leave' : 'leave' }); }
 }
 
 class OfflineSession {
   constructor(mode, me, onEvent) {
     this.online = false;
+    this.relay = false;
+    this.isHost = false;
+    this.hostPid = -1;
     this.mode = mode;
     this.myPid = 0;
     const per = MODES[mode].perTeam;
@@ -483,6 +659,7 @@ class OfflineSession {
   update(dt) { for (const b of this.bots) if (b) b.update(dt); this.core.update(dt); }
   sendDir(dir) { this.core.setInput(0, dir); }
   sendBomb() { this.core.queueBomb(0); }
+  ghostBombs() { return []; }
   close() {}
 }
 
@@ -532,7 +709,12 @@ class Net {
       ws.onclose = () => { fail(new Error('closed')); if (this.ws === ws) { this.ws = null; this.h.onClose(); } };
     });
   }
-  send(o) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(o)); }
+  send(o) {
+    const w = this.ws;
+    if (!w || w.readyState !== 1) return;
+    if (o.t === 'hs' && w.bufferedAmount > 200000) return;     // 회선이 밀리면 상태 전송을 건너뜀
+    w.send(JSON.stringify(o));
+  }
   close() { const w = this.ws; this.ws = null; if (w) { w.onclose = null; try { w.close(); } catch { /* 이미 닫힘 */ } } }
   get open() { return !!this.ws && this.ws.readyState === 1; }
 }
@@ -560,7 +742,20 @@ class App {
     this.last = performance.now();
 
     this.keys = new Keys(d => this.session && this.session.sendDir(d), () => this.pressBomb());
-    this.pad = new TouchPad($('dpad'), $('bomb-btn'), d => this.session && this.session.sendDir(d), () => this.pressBomb(), () => this.sfx.unlock());
+    this.pad = new TouchPad({
+      stick: $('stick'), knob: $('knob'), bombBtn: $('bomb-btn'),
+      onDir: d => this.session && this.session.sendDir(d),
+      onBomb: () => this.pressBomb(),
+      onGesture: () => this.sfx.unlock(),
+      isBlocked: dir => this.blockedDir(dir),
+    });
+    this.inRoom = false;
+    this.lobbyTab = 'auto';
+    this.createMode = '1v1';
+    this.noticeText = '';
+    this.noticeUntil = 0;
+    this.lastHidden = 0;
+    this.startTicker();
 
     this.buildTitle();
     this.buildModes();
@@ -695,22 +890,32 @@ class App {
   }
 
   openLobby() {
+    this.inRoom = false;
     this.show('lobby');
     $('lobby-title').textContent = this.offline ? '연습 게임' : this.server.name;
     $('btn-lobby-leave').textContent = this.offline ? '처음으로' : '서버 선택';
     $('btn-lobby-practice').classList.toggle('hidden', this.offline);
     $('btn-match').textContent = this.offline ? '연습 시작' : '게임 시작';
+    $('lobby-tabs').classList.toggle('hidden', this.offline);
     document.querySelector('.chat').classList.toggle('hidden', this.offline);
     $('me-name').textContent = this.name;
     $('me-sub').textContent = this.offline ? '봇과 대전합니다' : this.server.name + ' 접속중';
     skinAvatar($('me-avatar'), this.skin);
     this.markMode();
+    this.setTab(this.offline ? 'auto' : this.lobbyTab);
     if (this.offline) {
-      this.renderLobby({ online: 1, players: [{ n: this.name, s: 0 }] });
+      this.renderLobby({ online: 1, players: [{ n: this.name, s: 0 }], hrooms: [] });
     } else {
       $('chat-log').textContent = '';
-      this.chat(null, `${this.server.name}에 입장했습니다. 대전 방식을 고르고 게임 시작을 누르세요.`);
+      this.chat(null, `${this.server.name}에 입장했습니다. 자동 매칭을 하거나, 방 목록에서 방을 만들고 입장할 수 있습니다.`);
     }
+  }
+
+  setTab(tab) {
+    this.lobbyTab = tab;
+    $('tab-auto').classList.toggle('hidden', tab !== 'auto');
+    $('tab-rooms').classList.toggle('hidden', tab !== 'rooms');
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('sel', t.dataset.tab === tab));
   }
 
   renderLobby(m) {
@@ -725,6 +930,121 @@ class App {
       st.textContent = p.s === 1 ? '매칭중' : p.s === 2 ? '게임중' : '대기';
       li.append(n, st); ul.appendChild(li);
     }
+    this.renderRoomList(m.hrooms || []);
+  }
+
+  /* ---------- 방장 방식: 방 목록 / 만들기 / 대기방 ---------- */
+  renderRoomList(list) {
+    const ul = $('room-list');
+    ul.textContent = '';
+    if (!list.length) {
+      const li = document.createElement('li'); li.className = 'server-empty';
+      li.textContent = '열린 방이 없습니다. 방을 만들어 보세요!';
+      ul.appendChild(li);
+      return;
+    }
+    for (const r of list) {
+      const li = document.createElement('li'); li.className = 'room-row';
+      const left = document.createElement('div'); left.className = 'rr-main';
+      const title = document.createElement('div'); title.className = 'rr-title'; title.textContent = r.title;
+      const meta = document.createElement('div'); meta.className = 'rr-meta';
+      const chip = document.createElement('span'); chip.className = 'chip'; chip.textContent = (MODES[r.mode] || MODES['1v1']).label;
+      const cnt = document.createElement('span'); cnt.textContent = `${r.n} / ${r.cap}명`;
+      const host = document.createElement('span'); host.textContent = '방장 ' + r.host;
+      const st = document.createElement('span'); st.className = 'load-tag' + (r.st ? ' mid' : ''); st.textContent = r.st ? '게임중' : '대기중';
+      meta.append(chip, cnt, host, st);
+      left.append(title, meta);
+      const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'btn small';
+      btn.textContent = '입장'; btn.disabled = !!r.st || r.n >= r.cap;
+      btn.onclick = () => { this.sfx.unlock(); this.inRoom = true; this.net.send({ t: 'room_join', id: r.id }); };
+      li.append(left, btn);
+      ul.appendChild(li);
+    }
+  }
+
+  openCreateRoom() {
+    this.sfx.unlock();
+    this.createMode = this.mode;
+    $('room-title-input').value = (this.name + '의 방').slice(0, 16);
+    document.querySelectorAll('.rc-mode').forEach(b => b.classList.toggle('sel', b.dataset.mode === this.createMode));
+    $('room-create').classList.remove('hidden');
+    $('room-title-input').focus();
+    $('room-title-input').select();
+  }
+
+  renderRoom(m) {
+    this.room = m;
+    $('room-title').textContent = m.title;
+    $('room-mode').textContent = (MODES[m.mode] || MODES['1v1']).label;
+    const per = (MODES[m.mode] || MODES['1v1']).perTeam;
+    for (const t of [0, 1]) {
+      const ul = $('room-team' + t);
+      ul.textContent = '';
+      const list = m.members.map((x, i) => ({ ...x, i })).filter(x => x.team === t);
+      for (let k = 0; k < per; k++) {
+        const li = document.createElement('li'); li.className = 'rslot';
+        const x = list[k];
+        if (x) {
+          if (x.i === m.me) li.classList.add('me');
+          const cv = document.createElement('canvas'); cv.width = cv.height = 48; skinAvatar(cv, x.skin);
+          const n = document.createElement('span'); n.className = 'rn'; n.textContent = x.n + (x.i === m.me ? ' (나)' : '');
+          li.append(cv, n);
+          if (x.host) { const h = document.createElement('span'); h.className = 'host-tag'; h.textContent = '방장'; li.appendChild(h); }
+        } else {
+          li.classList.add('empty');
+          const n = document.createElement('span'); n.className = 'rn'; n.textContent = '빈 자리 (봇이 채웁니다)';
+          li.appendChild(n);
+        }
+        ul.appendChild(li);
+      }
+    }
+    const meInfo = m.members[m.me];
+    const iAmHost = !!(meInfo && meInfo.host);
+    $('btn-room-start').classList.toggle('hidden', !iAmHost);
+    $('room-wait').classList.toggle('hidden', iAmHost);
+    $('room-count').textContent = `${m.members.length} / ${m.cap}명`;
+  }
+
+  onRoom(m) {
+    if (!this.inRoom) return;                          // 이미 나간 방의 늦은 알림은 무시
+    this.renderRoom(m);
+    if (this.session) {
+      if (this.session.relay && m.state === 'waiting') {   // 한 판이 끝나 대기방으로 복귀
+        this.cleanupSession();
+        $('result').classList.add('hidden');
+        this.show('room');
+      }
+    } else if (!$('screen-room').classList.contains('active')) {
+      this.show('room');
+    }
+  }
+
+  notice(text) { this.noticeText = text; this.noticeUntil = performance.now() + 4500; }
+
+  /** 조이스틱 보정용: 지금 위치에서 그 방향이 막혀 있는가 */
+  blockedDir(dir) {
+    const s = this.session;
+    if (!s) return false;
+    const me = s.core.players[s.myPid];
+    if (!me) return false;
+    const d = DIRS[dir];
+    return !s.core.canEnter(me, me.x + d.dx, me.y + d.dy);
+  }
+
+  /** 방장의 탭이 백그라운드로 가도 게임이 멈추지 않도록 Worker 타이머로 계속 진행 (화면이 보일 때는 requestAnimationFrame 이 담당) */
+  startTicker() {
+    try {
+      const w = new Worker(URL.createObjectURL(new Blob(['setInterval(function(){postMessage(0)},16)'], { type: 'text/javascript' })));
+      w.onmessage = () => this.hiddenTick();
+      this.ticker = w;
+    } catch { this.ticker = null; }
+  }
+  hiddenTick() {
+    if (!document.hidden || !this.session || !this.session.isHost) { this.lastHidden = 0; return; }
+    const now = performance.now();
+    const dt = this.lastHidden ? Math.min(now - this.lastHidden, 100) : 16;
+    this.lastHidden = now;
+    this.session.update(dt);
   }
 
   chat(name, text) {
@@ -776,15 +1096,16 @@ class App {
   startOnline(m) {
     this.cleanupSession();
     this.resultShown = false;
-    const s = new OnlineSession(this.net, m);
-    s.onEvent = e => this.onEvent(e);
-    this.session = s;
+    this.session = new OnlineSession(this, m);
+    if (this.session.relay) this.inRoom = true;
     this.enterGame();
-    $('matching-title').childNodes[0].textContent = '매칭 성공!';
-    $('btn-fillbots').classList.add('hidden');
-    $('btn-cancel-match').disabled = true;
-    clearInterval(this.matchTimer);
-    setTimeout(() => this.closeMatching(), 900);
+    if (!this.session.relay) {                          // 전용 서버 자동 매칭: "매칭 성공!" 연출
+      $('matching-title').childNodes[0].textContent = '매칭 성공!';
+      $('btn-fillbots').classList.add('hidden');
+      $('btn-cancel-match').disabled = true;
+      clearInterval(this.matchTimer);
+      setTimeout(() => this.closeMatching(), 900);
+    }
   }
   enterGame() {
     this.sig = {};
@@ -792,14 +1113,18 @@ class App {
     $('result').classList.add('hidden');
     $('banner').classList.add('hidden');
     $('btn-rematch').classList.toggle('hidden', this.session.online);
+    $('result-hint').classList.add('hidden');
+    $('btn-result-exit').textContent = this.session.relay ? '나가기' : '로비로';
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
     this.show('game');
     this.buildSlots();
   }
   cleanupSession() { this.keys.reset(); this.pad.reset(); this.session = null; }
   leaveGame() {
+    const relay = this.session && this.session.relay;
     if (this.session) this.session.close();
     this.cleanupSession();
+    if (relay) this.inRoom = false;
     $('result').classList.add('hidden');
     if (!this.offline && !this.net.open) { this.onNetClosed(); return; }
     this.openLobby();
@@ -828,22 +1153,30 @@ class App {
 
   /* ---------- 네트워크 메시지 ---------- */
   onNet(m) {
+    if (this.session && this.session.online) {            // 게임 중 메시지(상태/입력 중계/방장 변경)는 세션이 처리
+      try { if (this.session.handle(m)) return; } catch (e) { console.error('세션 처리 오류', e); return; }
+    }
     switch (m.t) {
       case 'lobby': this.renderLobby(m); break;
       case 'chat': this.chat(m.name, m.text); break;
-      case 'queue':
-        $('matching-count').textContent = `${m.count} / ${m.need}`;
+      case 'queue': $('matching-count').textContent = `${m.count} / ${m.need}`; break;
+      case 'start': case 'hstart': this.startOnline(m); break;
+      case 'room': this.onRoom(m); break;
+      case 'room_closed': {
+        const relay = this.inRoom || (this.session && this.session.relay);
+        this.cleanupSession();
+        $('result').classList.add('hidden');
+        this.inRoom = false;
+        if (relay) this.dialog('방이 닫혔습니다.', () => this.openLobby());
+        else this.openLobby();
         break;
-      case 'start': this.startOnline(m); break;
-      case 's': if (this.session && this.session.online) this.session.handleSnapshot(m); break;
-      case 'room_closed':
-        if (this.session && this.session.online) { this.cleanupSession(); $('result').classList.add('hidden'); this.openLobby(); }
-        break;
-      case 'error': this.closeMatching(); this.dialog(m.msg || '오류가 발생했습니다.'); break;
+      }
+      case 'error': this.inRoom = false; this.closeMatching(); this.dialog(m.msg || '오류가 발생했습니다.'); break;
     }
   }
   onNetClosed() {
     if (this.offline) return;
+    this.inRoom = false;
     this.closeMatching();
     this.cleanupSession();
     $('result').classList.add('hidden');
@@ -862,7 +1195,7 @@ class App {
       const n = document.createElement('span'); n.className = 'sn'; n.textContent = p.name + (p.id === this.session.myPid ? ' (나)' : '');
       const s = document.createElement('span'); s.className = 'ss';
       li.append(n, s); ul.appendChild(li);
-      return { li, s };
+      return { li, s, n };
     });
   }
   buildStatIcons() {
@@ -881,6 +1214,11 @@ class App {
 
   updateHud() {
     const s = this.session, c = s.core, me = c.players[s.myPid];
+    const hsig = 'h' + s.hostPid;
+    if (this.sig.hostTag !== hsig) {                        // 방장 표시
+      this.sig.hostTag = hsig;
+      c.players.forEach((p, i) => { this.slotEls[i].n.textContent = p.name + (i === s.myPid ? ' (나)' : '') + (s.relay && i === s.hostPid ? ' [방장]' : ''); });
+    }
     const sec = Math.max(0, Math.ceil(c.roundTimer / 1000));
     const timer = Math.floor(sec / 60) + ':' + String(sec % 60).padStart(2, '0');
     if (this.sig.timer !== timer) { this.sig.timer = timer; $('timer').textContent = timer; $('timer').classList.toggle('low', sec <= 20); }
@@ -934,6 +1272,7 @@ class App {
       cls = w === me.team ? 'win' : w === -1 ? '' : 'lose';
       sub = `${TEAM[0].name} ${c.teamWins[0]} : ${c.teamWins[1]} ${TEAM[1].name}`;
     }
+    if (!main && performance.now() < this.noticeUntil) { sub = this.noticeText; low = true; }   // 방장 변경 안내
     const sig = [main, sub, cls, low].join('|');
     if (sig === this.sig.banner) return;
     this.sig.banner = sig;
@@ -965,6 +1304,7 @@ class App {
       const sc = document.createElement('td'); sc.className = 'num'; sc.textContent = p.score;
       tr.append(a, k, sc); tb.appendChild(tr);
     }
+    $('result-hint').classList.toggle('hidden', !s.relay);
     $('result').classList.remove('hidden');
   }
 
@@ -989,6 +1329,22 @@ class App {
       if (v) this.net.send({ t: 'chat', text: v });
       $('chat-input').value = '';
     };
+    document.querySelectorAll('.tab').forEach(t => { t.onclick = () => this.setTab(t.dataset.tab); });
+    $('btn-room-create').onclick = () => this.openCreateRoom();
+    document.querySelectorAll('.rc-mode').forEach(b => {
+      b.onclick = () => { this.createMode = b.dataset.mode; document.querySelectorAll('.rc-mode').forEach(x => x.classList.toggle('sel', x === b)); };
+    });
+    $('btn-create-cancel').onclick = () => $('room-create').classList.add('hidden');
+    $('room-create-form').onsubmit = e => {
+      e.preventDefault();
+      const title = $('room-title-input').value.trim() || (this.name + '의 방');
+      this.inRoom = true;
+      this.net.send({ t: 'room_create', mode: this.createMode, title });
+      $('room-create').classList.add('hidden');
+    };
+    $('btn-team').onclick = () => this.net.send({ t: 'team' });
+    $('btn-room-start').onclick = () => { this.sfx.unlock(); this.net.send({ t: 'room_start' }); };
+    $('btn-room-leave').onclick = () => { this.inRoom = false; this.net.send({ t: 'room_leave' }); this.openLobby(); };
     $('btn-pad').onclick = () => document.body.classList.toggle('pad-on');
     $('btn-mute').onclick = () => {
       this.sfx.muted = !this.sfx.muted;
@@ -1004,8 +1360,9 @@ class App {
     const dt = Math.min(ts - this.last, 100);
     this.last = ts;
     if (this.session) {
+      this.pad.tick();
       this.session.update(dt);
-      this.renderer.draw(this.session.core, ts, this.session.myPid);
+      this.renderer.draw(this.session.core, ts, this.session.myPid, this.session.ghostBombs(ts));
       this.updateHud();
       this.updateBanner(ts);
       if (this.session.core.state === 'matchOver' && !this.resultShown) this.showResult();

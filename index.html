@@ -66,13 +66,24 @@
       </div>
       <div class="lobby-grid">
         <div class="lobby-main">
-          <div class="panel-title">대전 방식</div>
-          <div id="mode-cards" class="mode-cards" role="radiogroup" aria-label="대전 방식"></div>
-          <div class="btn-row">
-            <button id="btn-match" class="btn huge" type="button">게임 시작</button>
+          <div id="lobby-tabs" class="tabs">
+            <button type="button" class="tab sel" data-tab="auto">자동 매칭</button>
+            <button type="button" class="tab" data-tab="rooms">방 목록</button>
           </div>
-          <div class="btn-row">
-            <button id="btn-lobby-practice" class="btn small blue" type="button">연습 게임 (봇)</button>
+          <div id="tab-auto">
+            <div class="panel-title">대전 방식</div>
+            <div id="mode-cards" class="mode-cards" role="radiogroup" aria-label="대전 방식"></div>
+            <div class="btn-row">
+              <button id="btn-match" class="btn huge" type="button">게임 시작</button>
+            </div>
+            <div class="btn-row">
+              <button id="btn-lobby-practice" class="btn small blue" type="button">연습 게임 (봇)</button>
+            </div>
+          </div>
+          <div id="tab-rooms" class="hidden">
+            <div class="btn-row"><button id="btn-room-create" class="btn" type="button">방 만들기</button></div>
+            <ul id="room-list" class="room-list"></ul>
+            <p class="hint">처음 들어간 사람이 방장입니다. 방장이 나가면 다음 사람이 방장이 되어 방이 유지됩니다.</p>
           </div>
           <div class="me-card">
             <canvas id="me-avatar" width="64" height="64"></canvas>
@@ -93,6 +104,26 @@
           <input id="chat-input" class="text-input" type="text" maxlength="60" placeholder="채팅 입력 후 Enter" spellcheck="false">
           <button class="btn small" type="submit">전송</button>
         </form>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 3-2. 대기방 (방장 방식) ============ -->
+  <section id="screen-room" class="screen">
+    <div class="win lobby-win">
+      <div class="titlebar"><span id="room-title">방</span><span id="room-mode" class="chip"></span></div>
+      <div class="win-body">
+        <div class="room-teams">
+          <div><div class="panel-title">A 팀</div><ul id="room-team0" class="rslots"></ul></div>
+          <div><div class="panel-title">B 팀</div><ul id="room-team1" class="rslots"></ul></div>
+        </div>
+        <p class="hint">인원 <b id="room-count"></b> · 빈 자리는 봇이 채웁니다.</p>
+        <p id="room-wait" class="hint hidden">방장이 시작하기를 기다리는 중...</p>
+        <div class="btn-row">
+          <button id="btn-team" class="btn blue" type="button">팀 바꾸기</button>
+          <button id="btn-room-start" class="btn hidden" type="button">게임 시작</button>
+          <button id="btn-room-leave" class="btn gray" type="button">나가기</button>
+        </div>
       </div>
     </div>
   </section>
@@ -128,8 +159,9 @@
     </div>
 
     <section id="joypad" class="joypad" aria-label="가상 조이패드">
-      <div id="dpad" class="dpad">
-        <span data-dir="up"></span><span data-dir="left"></span><span data-dir="right"></span><span data-dir="down"></span>
+      <div id="stick" class="stick">
+        <span class="arr" data-dir="up"></span><span class="arr" data-dir="left"></span><span class="arr" data-dir="right"></span><span class="arr" data-dir="down"></span>
+        <div id="knob" class="knob"></div>
       </div>
       <button id="bomb-btn" class="bomb-btn" type="button" aria-label="물풍선 놓기"><span>물풍선</span></button>
     </section>
@@ -141,6 +173,7 @@
         <div id="result-title" class="result-title"></div>
         <div id="result-sub" class="result-sub"></div>
         <table id="result-table" class="result-table"></table>
+        <p id="result-hint" class="hint hidden">잠시 후 대기방으로 돌아갑니다.</p>
         <div class="btn-row">
           <button id="btn-rematch" class="btn blue hidden" type="button">다시 하기</button>
           <button id="btn-result-exit" class="btn" type="button">로비로</button>
@@ -165,6 +198,25 @@
         <button id="btn-cancel-match" class="btn gray" type="button">취소</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ============ 방 만들기 ============ -->
+<div id="room-create" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="win dialog-win">
+    <div class="titlebar">방 만들기</div>
+    <form id="room-create-form" class="win-body center" autocomplete="off">
+      <input id="room-title-input" class="text-input" type="text" maxlength="16" placeholder="방 제목" spellcheck="false">
+      <div class="btn-row">
+        <button type="button" class="btn small rc-mode sel" data-mode="1v1">1 : 1</button>
+        <button type="button" class="btn small rc-mode" data-mode="2v2">2 : 2</button>
+        <button type="button" class="btn small rc-mode" data-mode="3v3">3 : 3</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn" type="submit">만들기</button>
+        <button id="btn-create-cancel" class="btn gray" type="button">취소</button>
+      </div>
+    </form>
   </div>
 </div>
 

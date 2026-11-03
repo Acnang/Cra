@@ -19,7 +19,7 @@
  *  환경변수 (모두 선택)
  *    PORT(8080) HOST(0.0.0.0) CHANNELS(3) CHANNEL_START(1) CHANNEL_CAP(100) MAX_PER_IP(8)
  *    ALLOWED_ORIGINS(쉼표 구분, 비우면 모두 허용) TRUST_PROXY(1이면 X-Forwarded-For 사용)
- *    ROOM_WINS(2) BOT_FILL_AFTER_MS(8000)
+ *    ROOM_WINS(2) BOT_FILL_AFTER_MS(8000) HOST_STALL_MS(3000)
  * ========================================================================== */
 const http = require('http');
 const fs = require('fs');
@@ -37,6 +37,7 @@ const CHANNEL_CAP = Math.max(2, env('CHANNEL_CAP', 100));
 const MAX_PER_IP = env('MAX_PER_IP', 8);
 const ROOM_WINS = env('ROOM_WINS', 2);
 const BOT_FILL_AFTER_MS = env('BOT_FILL_AFTER_MS', 8000);
+const HOST_STALL_MS = env('HOST_STALL_MS', 3000);   // 방장이 이 시간 동안 상태를 안 보내면 다음 사람에게 방장을 넘김
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
@@ -77,8 +78,29 @@ class Client {
     this.lastToken = Date.now();
     this.strikes = 0;
     this.lastChat = 0;
+    this.hroom = null;           // 방장 방식 방
+    this.hpid = -1;
   }
   send(obj) { this.conn.send(JSON.stringify(obj)); }
+}
+
+/** 팀별 사람 목록 → 슬롯 배열(팀0 먼저, 팀1 나중). 빈 자리는 봇, 같은 캐릭터는 겹치지 않게 조정 */
+function buildSlots(mode, lists) {
+  const per = MODES[mode].perTeam;
+  const used = new Set();
+  const pick = want => {
+    let sk = want;
+    if (used.has(sk)) for (let k = 0; k < SKIN_COUNT; k++) if (!used.has(k)) { sk = k; break; }
+    used.add(sk);
+    return sk;
+  };
+  const out = [[], []];
+  for (const t of [0, 1]) for (const c of lists[t]) out[t].push({ client: c, name: c.name, skin: pick(c.skin), bot: false });
+  let botNo = 1;
+  for (const t of [0, 1]) {
+    while (out[t].length < per) out[t].push({ client: null, name: '봇' + botNo++, skin: pick((used.size + 1) % SKIN_COUNT), bot: true });
+  }
+  return [...out[0].map(x => ({ ...x, team: 0 })), ...out[1].map(x => ({ ...x, team: 1 }))];
 }
 
 /* ----------------------------------------------------------------------------
@@ -94,24 +116,7 @@ class Room {
     this.overAt = 0;
     this.destroyed = false;
 
-    const per = MODES[mode].perTeam;
-    const teams = [[], []];
-    const usedSkins = new Set();
-    // 같은 캐릭터를 고른 사람이 있으면 구분되도록 비어 있는 캐릭터로 바꿔 줌
-    const pickSkin = want => {
-      let s = want;
-      if (usedSkins.has(s)) for (let k = 0; k < SKIN_COUNT; k++) if (!usedSkins.has(k)) { s = k; break; }
-      usedSkins.add(s);
-      return s;
-    };
-    humans.forEach((h, i) => teams[i % 2].push({ client: h, name: h.name, skin: pickSkin(h.skin), bot: false }));
-    let botNo = 1;
-    for (const t of [0, 1]) {
-      while (teams[t].length < per) {
-        teams[t].push({ client: null, name: '봇' + botNo++, skin: pickSkin((usedSkins.size + 1) % SKIN_COUNT), bot: true });
-      }
-    }
-    this.slots = [...teams[0].map(s => ({ ...s, team: 0 })), ...teams[1].map(s => ({ ...s, team: 1 }))];
+    this.slots = buildSlots(mode, [humans.filter((_, i) => i % 2 === 0), humans.filter((_, i) => i % 2 === 1)]);
 
     this.core = new GameCore({
       seed: (Math.random() * 4294967296) >>> 0,
@@ -188,6 +193,167 @@ class Room {
 }
 
 /* ----------------------------------------------------------------------------
+ * 방장 방식 방 — 방장의 브라우저가 게임을 계산하고, 서버는 "중계"만 한다
+ *   - 방을 만든(첫 입장) 사람이 방장. 방장이 나가거나 멈추면 먼저 들어온 다음 사람이 방장이 됨
+ *   - 서버는 게임 규칙을 모름: 참가자 입력 → 방장에게 / 방장이 만든 상태 → 참가자들에게 전달
+ *   - 모든 참가자의 화면에는 항상 최신 상태가 있어서, 새 방장이 그 상태 그대로 이어받아 진행
+ * -------------------------------------------------------------------------- */
+let nextHostRoomId = 1;
+class HostRoom {
+  constructor(channel, host, mode, title) {
+    this.id = nextHostRoomId++;
+    this.channel = channel;
+    this.mode = mode;
+    this.title = title;
+    this.state = 'waiting';          // waiting | playing
+    this.members = [];               // 들어온 순서 = 방장 승계 순서
+    this.team = new Map();           // client → 0|1
+    this.host = host;
+    this.slots = null;
+    this.lastHostSnap = 0;
+    this.destroyed = false;
+    channel.hrooms.set(this.id, this);
+    this.add(host);
+    log(`[${channel.name}] 방 #${this.id} "${title}" ${mode} 생성 — 방장 ${host.name}`);
+  }
+
+  get cap() { return MODES[this.mode].perTeam * 2; }
+  teamCount(t) { let n = 0; for (const m of this.members) if (this.team.get(m) === t) n++; return n; }
+  canJoin() { return this.state === 'waiting' && this.members.length < this.cap; }
+
+  add(client) {
+    const t = this.teamCount(0) <= this.teamCount(1) ? 0 : 1;      // 인원이 적은 팀으로
+    this.members.push(client);
+    this.team.set(client, t);
+    client.state = 'hroom';
+    client.hroom = this;
+    client.hpid = -1;
+    this.broadcastRoom();
+  }
+
+  broadcastRoom() {
+    const list = this.members.map(m => ({ n: m.name, skin: m.skin, team: this.team.get(m), host: m === this.host }));
+    this.members.forEach((m, i) => m.send({
+      t: 'room', id: this.id, title: this.title, mode: this.mode, state: this.state, cap: this.cap, me: i, members: list,
+    }));
+  }
+
+  switchTeam(client) {
+    if (this.state !== 'waiting') return;
+    const cur = this.team.get(client), other = 1 - cur;
+    if (this.teamCount(other) >= MODES[this.mode].perTeam) return;
+    this.team.set(client, other);
+    this.broadcastRoom();
+  }
+
+  botPids() { return this.slots ? this.slots.map((s, i) => (s.client ? -1 : i)).filter(i => i >= 0) : []; }
+
+  start(client) {
+    if (client !== this.host || this.state !== 'waiting') return;
+    const lists = [0, 1].map(t => this.members.filter(m => this.team.get(m) === t));
+    this.slots = buildSlots(this.mode, lists);
+    this.slots.forEach((s, pid) => { if (s.client) s.client.hpid = pid; });
+    this.state = 'playing';
+    this.lastHostSnap = Date.now();
+    const seed = (Math.random() * 4294967296) >>> 0;
+    const players = this.slots.map(s => ({ name: s.name, team: s.team, skin: s.skin, bot: s.bot }));
+    const bots = this.botPids();
+    for (const m of this.members) {
+      m.send({ t: 'hstart', mode: this.mode, you: m.hpid, hostPid: this.host.hpid, seed, players, winsToMatch: ROOM_WINS, bots });
+    }
+    this.channel.dirty();
+    log(`[${this.channel.name}] 방 #${this.id} 게임 시작 (사람 ${this.members.length}명 / 봇 ${bots.length}명)`);
+  }
+
+  /** 한 판이 끝나면 방장이 알려 줘서 모두 대기방으로 돌아감 */
+  end(client) {
+    if (client !== this.host || this.state !== 'playing') return;
+    this.state = 'waiting';
+    this.slots = null;
+    for (const m of this.members) m.hpid = -1;
+    this.broadcastRoom();
+    this.channel.dirty();
+  }
+
+  /** 참가자 입력 → 방장에게 전달 */
+  fromGuest(client, type, dir) {
+    if (this.state !== 'playing' || client === this.host || client.hpid < 0) return;
+    this.host.send(type === 'in' ? { t: 'r_in', pid: client.hpid, dir } : { t: 'r_bomb', pid: client.hpid });
+  }
+
+  /** 방장의 게임 상태 → 나머지 참가자에게 전달 (현재 방장이 보낸 것만 받음) */
+  hostSnapshot(client, msg) {
+    if (client !== this.host || this.state !== 'playing') return;
+    if (!msg.s || typeof msg.s !== 'object') return;
+    this.lastHostSnap = Date.now();
+    const out = JSON.stringify({ t: 's', s: msg.s, ev: Array.isArray(msg.ev) ? msg.ev.slice(0, 60) : [] });
+    for (const m of this.members) if (m !== this.host) m.conn.send(out);
+  }
+
+  /** 나가기/접속 끊김. 방장이었다면 다음 사람이 방장이 됨 */
+  leave(client) {
+    const i = this.members.indexOf(client);
+    if (i < 0) return;
+    this.members.splice(i, 1);
+    this.team.delete(client);
+    const wasHost = this.host === client;
+    const pid = client.hpid;
+    client.hroom = null;
+    client.hpid = -1;
+    if (client.state === 'hroom') client.state = 'lobby';
+    if (this.members.length === 0) { this.destroy(); return; }
+    if (this.state === 'playing' && pid >= 0 && this.slots[pid]) {      // 그 자리는 봇이 이어받음
+      this.slots[pid].client = null;
+      this.slots[pid].bot = true;
+    }
+    if (wasHost) this.promote('방장 나감');
+    else if (this.state === 'playing') this.host.send({ t: 'peer_left', pid });
+    else this.broadcastRoom();
+    this.channel.dirty();
+  }
+
+  promote(reason) {
+    const next = this.members[0];
+    if (!next) { this.destroy(); return; }
+    this.host = next;
+    this.lastHostSnap = Date.now();
+    log(`[${this.channel.name}] 방 #${this.id} 방장 변경 → ${next.name} (${reason})`);
+    if (this.state === 'playing') {
+      const msg = { t: 'host_change', hostPid: next.hpid, name: next.name, bots: this.botPids() };
+      for (const m of this.members) m.send(msg);
+    } else {
+      this.broadcastRoom();
+    }
+  }
+
+  /** 방장이 멈춘 경우(탭이 백그라운드, 네트워크 끊김 등) 다음 사람에게 방장을 넘김 */
+  checkHost(now) {
+    if (this.state !== 'playing') return;
+    const stalled = now - this.lastHostSnap;
+    if (stalled > 120000) { this.destroy(); return; }
+    if (stalled > HOST_STALL_MS && this.members.length > 1) {
+      const old = this.host;
+      this.members.splice(this.members.indexOf(old), 1);
+      this.members.push(old);                       // 멈춘 사람은 승계 순서 맨 뒤로
+      this.promote('응답 없음');
+    }
+  }
+
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    for (const m of this.members) {
+      m.hroom = null; m.hpid = -1;
+      if (m.state === 'hroom') { m.state = 'lobby'; m.send({ t: 'room_closed' }); }
+    }
+    this.members = [];
+    this.channel.hrooms.delete(this.id);
+    this.channel.dirty();
+    log(`[${this.channel.name}] 방 #${this.id} 종료`);
+  }
+}
+
+/* ----------------------------------------------------------------------------
  * 채널(서버 1,2,3...) — 로비 + 매칭 대기열
  * -------------------------------------------------------------------------- */
 class Channel {
@@ -198,6 +364,7 @@ class Channel {
     this.queues = {};
     for (const m of Object.keys(MODES)) this.queues[m] = [];
     this.rooms = new Set();
+    this.hrooms = new Map();             // 방장 방식 방
     this.lobbyDirty = false;
     this.lastLobby = 0;
   }
@@ -205,7 +372,7 @@ class Channel {
   status() {
     const queue = {};
     for (const m of Object.keys(MODES)) queue[m] = this.queues[m].length;
-    return { id: this.id, name: this.name, online: this.clients.size, cap: CHANNEL_CAP, rooms: this.rooms.size, queue };
+    return { id: this.id, name: this.name, online: this.clients.size, cap: CHANNEL_CAP, rooms: this.rooms.size + this.hrooms.size, queue };
   }
 
   dirty() { this.lobbyDirty = true; }
@@ -219,7 +386,12 @@ class Channel {
       if (c.state === 'new') continue;
       if (list.length < 80) list.push({ n: c.name, s: c.state === 'lobby' ? 0 : c.state === 'queue' ? 1 : 2 });
     }
-    const msg = JSON.stringify({ t: 'lobby', online: this.clients.size, rooms: this.rooms.size, players: list });
+    const hr = [];
+    for (const r of this.hrooms.values()) {
+      if (hr.length >= 30) break;
+      hr.push({ id: r.id, title: r.title, mode: r.mode, n: r.members.length, cap: r.cap, st: r.state === 'waiting' ? 0 : 1, host: r.host.name });
+    }
+    const msg = JSON.stringify({ t: 'lobby', online: this.clients.size, rooms: this.rooms.size + this.hrooms.size, players: list, hrooms: hr });
     for (const c of this.clients) if (c.state === 'lobby' || c.state === 'queue') c.conn.send(msg);
   }
 
@@ -268,7 +440,7 @@ class Channel {
   }
 
   openRoom(mode, humans) {
-    if (this.rooms.size >= MAX_ROOMS) {          // 방이 너무 많으면 새로 만들지 않음 (서버 보호)
+    if (this.rooms.size + this.hrooms.size >= MAX_ROOMS) {          // 방이 너무 많으면 새로 만들지 않음 (서버 보호)
       for (const c of humans) { c.state = 'lobby'; c.mode = null; c.send({ t: 'error', code: 'busy', msg: '지금은 방이 가득 찼습니다. 잠시 후 다시 시도해 주세요.' }); }
       return;
     }
@@ -279,9 +451,30 @@ class Channel {
     }
   }
 
+  createHostRoom(client, msg) {
+    if (client.state !== 'lobby') return;
+    const mode = MODES[msg.mode] ? msg.mode : '1v1';
+    if (this.rooms.size + this.hrooms.size >= MAX_ROOMS) {
+      client.send({ t: 'error', code: 'busy', msg: '지금은 방이 가득 찼습니다. 잠시 후 다시 시도해 주세요.' });
+      return;
+    }
+    new HostRoom(this, client, mode, cleanText(msg.title, 16, client.name + '의 방'));
+    this.dirty();
+  }
+
+  joinHostRoom(client, id) {
+    if (client.state !== 'lobby') return;
+    const room = this.hrooms.get(id);
+    if (!room) { client.send({ t: 'error', code: 'noroom', msg: '방을 찾을 수 없습니다.' }); return; }
+    if (!room.canJoin()) { client.send({ t: 'error', code: 'full', msg: '방이 가득 찼거나 이미 게임이 진행 중입니다.' }); return; }
+    room.add(client);
+    this.dirty();
+  }
+
   add(client) { this.clients.add(client); this.dirty(); }
 
   remove(client) {
+    if (client.hroom) client.hroom.leave(client);
     this.dequeue(client);
     if (client.room) client.room.removeClient(client);
     this.clients.delete(client);
@@ -298,6 +491,11 @@ const ipCount = new Map();
  * -------------------------------------------------------------------------- */
 function onMessage(client, raw) {
   const now = Date.now();
+  // 방장의 상태 전송만 큰 메시지를 허용
+  if (raw.length > 1024 && !(client.hroom && client.hroom.host === client && client.hroom.state === 'playing')) {
+    client.strikes++;
+    return;
+  }
   client.tokens = Math.min(60, client.tokens + (now - client.lastToken) * 0.05);   // 초당 50개
   client.lastToken = now;
   if (client.tokens < 1) {
@@ -327,18 +525,29 @@ function onMessage(client, raw) {
     case 'cancel': ch.dequeue(client); break;
     case 'fillbots': ch.fillWithBots(client); break;
     case 'in': {
-      if (!client.room) return;
       const dir = DIR_NAMES.includes(msg.dir) ? msg.dir : null;
-      client.room.input(client, dir);
+      if (client.room) client.room.input(client, dir);
+      else if (client.hroom) client.hroom.fromGuest(client, 'in', dir);
       break;
     }
-    case 'bomb': if (client.room) client.room.bomb(client); break;
+    case 'bomb':
+      if (client.room) client.room.bomb(client);
+      else if (client.hroom) client.hroom.fromGuest(client, 'bomb');
+      break;
+    // ----- 방장 방식 -----
+    case 'room_create': ch.createHostRoom(client, msg); break;
+    case 'room_join': ch.joinHostRoom(client, msg.id | 0); break;
+    case 'room_leave': if (client.hroom) client.hroom.leave(client); break;
+    case 'team': if (client.hroom) client.hroom.switchTeam(client); break;
+    case 'room_start': if (client.hroom) client.hroom.start(client); break;
+    case 'room_end': if (client.hroom) client.hroom.end(client); break;
+    case 'hs': if (client.hroom) client.hroom.hostSnapshot(client, msg); break;
     case 'leave': {
       if (client.room) { client.room.removeClient(client); client.state = 'lobby'; ch.dirty(); }
       break;
     }
     case 'chat': {
-      if (client.state === 'room' || now - client.lastChat < 700) return;
+      if (client.state === 'room' || client.state === 'hroom' || now - client.lastChat < 700) return;
       const text = cleanText(msg.text, 60);
       if (!text) return;
       client.lastChat = now;
@@ -409,7 +618,7 @@ server.on('upgrade', (req, socket, head) => {
   const ip = clientIp(req);
   if ((ipCount.get(ip) || 0) >= MAX_PER_IP) { socket.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n'); return; }
 
-  acceptWebSocket(req, socket, { maxPayload: 1024 }, conn => {
+  acceptWebSocket(req, socket, { maxPayload: 16384 }, conn => {
     if (ch.clients.size >= CHANNEL_CAP) {                   // 정원 초과: 안내 후 종료
       conn.send(JSON.stringify({ t: 'full', msg: '서버가 가득 찼습니다. 다른 서버를 선택해 주세요.' }));
       setTimeout(() => conn.close(1013), 100);
@@ -455,6 +664,7 @@ setInterval(() => {
       try { room.update(dt, now); }
       catch (e) { console.error('방 처리 오류 — 방 종료', e); room.destroy(); }
     }
+    for (const hr of [...ch.hrooms.values()]) hr.checkHost(now);
     if (ch.lobbyDirty && now - ch.lastLobby >= 500) ch.flushLobby(now);
   }
 }, 16);

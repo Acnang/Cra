@@ -121,7 +121,7 @@ async function api(base = BASE) { return (await fetch(base + '/api/servers')).js
     const chat = x.msgs.find(m => m.t === 'chat');
     ok(chat && !/[<>]/.test(chat.text), '채팅 특수문자 제거');
     ok(x.ws.readyState === 1, '잘못된 데이터에도 연결/서버 유지');
-    x.ws.send('x'.repeat(5000));
+    x.ws.send('x'.repeat(20000));
     await sleep(300);
     ok(x.closed, '너무 큰 메시지는 연결 종료');
     const r = await fetch(BASE + '/../../etc/passwd').catch(() => null);
