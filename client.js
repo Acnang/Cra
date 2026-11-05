@@ -720,6 +720,283 @@ class Net {
 }
 
 /* ============================================================================
+ * 6-2. P2PNet — 서버 없이 하는 온라인 (PeerJS / WebRTC)
+ *  Net 과 같은 모양(send / close / open)이라 나머지 코드는 그대로 씁니다.
+ *  - 방 주소가 고정되어 있음: bubblegrid-p2p-<서버번호>-<방식>-<칸>
+ *  - 먼저 매칭을 누른 사람이 그 주소를 "차지"해 방장이 되고, 다음 사람은 주소가 이미 쓰이고 있으므로 그 방에 접속
+ *  - 방장이 나가면 남은 사람 중 순서가 앞선 사람이 같은 주소를 다시 차지해 새 방장이 됨 (나머지는 그 주소로 재접속)
+ * ========================================================================== */
+const P2P_SLOTS = 6;
+function loadPeerLib() {
+  if (window.Peer) return Promise.resolve();
+  const urls = ['https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js', 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js'];
+  return urls.reduce((p, u) => p.catch(() => new Promise((res, rej) => {
+    const el = document.createElement('script');
+    el.src = u; el.onload = () => (window.Peer ? res() : rej(new Error('lib'))); el.onerror = () => rej(new Error('load'));
+    document.head.appendChild(el);
+  })), Promise.reject(new Error('start')));
+}
+
+class P2PNet {
+  constructor(h) { this.h = h; this.open = true; this.ch = 1; this.me = { name: '', skin: 0 }; this.mode = '1v1'; this.gen = 0; this.hardReset(); }
+  configure(ch, me) { this.ch = ch; this.me = me; }
+  roomId(slot) { return `bubblegrid-p2p-${this.ch}-${this.mode}-${slot}`; }
+  need() { return MODES[this.mode].perTeam * 2; }
+  emit(m) { try { this.h.onMessage(m); } catch (e) { console.error(e); } }
+
+  hardReset() {
+    this.gen++;
+    clearInterval(this.tBeat); clearTimeout(this.tMig); clearTimeout(this.tGrace);
+    for (const p of [this.peer, this.gpeer]) { try { if (p) p.destroy(); } catch { /* 이미 닫힘 */ } }
+    this.peer = this.gpeer = this.conn = null;
+    this.role = null; this.phase = 'idle'; this.members = []; this.pmap = new Map();
+    this.myPid = -1; this.hostPid = -1; this.defs = []; this.slot = 0; this.lastRecv = 0;
+  }
+  close() { this.hardReset(); }
+  fail(g, msg) { if (g !== this.gen) return; this.hardReset(); this.emit({ t: 'error', msg }); }
+
+  send(o) {
+    switch (o.t) {
+      case 'queue': this.mode = o.mode; this.begin(); break;
+      case 'cancel': case 'leave': case 'room_leave': this.hardReset(); break;
+      case 'fillbots':
+        if (this.role === 'host' && this.phase === 'wait') this.startGame();
+        else if (this.role === 'guest' && this.phase === 'wait' && this.conn) this.conn.send({ t: 'fillbots' });
+        break;
+      case 'in': case 'bomb': if (this.role === 'guest' && this.conn && this.conn.open) this.conn.send(o); break;
+      case 'hs':
+        if (this.role === 'host') for (const c of this.pmap.values()) if (c.open) c.send({ t: 's', s: o.s, ev: o.ev });
+        break;
+      case 'room_end':
+        if (this.role === 'host') {
+          for (const c of this.pmap.values()) if (c.open) c.send({ t: 'p2p_end' });
+          this.emit({ t: 'p2p_end' });
+          const g = this.gen; setTimeout(() => { if (g === this.gen) this.hardReset(); }, 400);
+        }
+        break;
+      default: break;
+    }
+  }
+
+  /* ----- 매칭: 주소 차지 시도 → 실패하면 그 방에 참가 ----- */
+  async begin() {
+    this.hardReset();
+    const g = this.gen;
+    this.phase = 'find';
+    try { await loadPeerLib(); } catch { this.fail(g, 'P2P 연결 도구를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.'); return; }
+    if (g === this.gen) this.find(0, 0, g);
+  }
+
+  find(slot, tries, g) {
+    if (g !== this.gen) return;
+    if (tries >= P2P_SLOTS * 2) { this.fail(g, '매칭에 실패했습니다. 잠시 후 다시 시도해 주세요.'); return; }
+    let peer;
+    try { peer = new Peer(this.roomId(slot % P2P_SLOTS)); } catch { this.fail(g, 'P2P 연결을 만들지 못했습니다.'); return; }
+    this.peer = peer;
+    peer.on('open', () => { if (g === this.gen) this.hostWait(slot, g); });
+    peer.on('error', err => {
+      if (g !== this.gen || this.phase !== 'find') return;
+      try { peer.destroy(); } catch { /* 이미 닫힘 */ }
+      this.peer = null;
+      if (err && err.type === 'unavailable-id') this.guestJoin(slot, tries, g);
+      else this.fail(g, 'P2P 중계 서버에 접속하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+    });
+  }
+
+  guestJoin(slot, tries, g) {
+    let gp;
+    try { gp = new Peer(); } catch { this.fail(g, 'P2P 연결을 만들지 못했습니다.'); return; }
+    this.gpeer = gp;
+    const next = () => {
+      if (g !== this.gen || this.phase !== 'find') return;
+      try { gp.destroy(); } catch { /* 이미 닫힘 */ }
+      this.gpeer = null; this.conn = null;
+      this.find(slot + 1, tries + 1, g);
+    };
+    const retrySame = () => {                       // 그 사이 방장이 사라졌으면 내가 그 주소를 차지
+      if (g !== this.gen || this.phase !== 'find') return;
+      try { gp.destroy(); } catch { /* 이미 닫힘 */ }
+      this.gpeer = null; this.conn = null;
+      this.find(slot, tries + 1, g);
+    };
+    const timer = setTimeout(next, 7000);
+    gp.on('error', err => {
+      if (g !== this.gen || this.phase !== 'find') return;
+      clearTimeout(timer);
+      if (err && err.type === 'peer-unavailable') retrySame(); else this.fail(g, 'P2P 중계 서버에 접속하지 못했습니다.');
+    });
+    gp.on('open', () => {
+      if (g !== this.gen) return;
+      const c = gp.connect(this.roomId(slot % P2P_SLOTS), { reliable: true, serialization: 'json' });
+      c.on('open', () => c.send({ t: 'join', name: this.me.name, skin: this.me.skin }));
+      c.on('data', m => {
+        if (g !== this.gen || !m) return;
+        if (m.t === 'full') { clearTimeout(timer); next(); return; }
+        if (m.t === 'queue' && this.phase === 'find') {                // 방에 들어감
+          clearTimeout(timer); this.phase = 'wait'; this.role = 'guest'; this.conn = c; this.slot = slot % P2P_SLOTS; this.watch(g);
+        }
+        this.onHostMsg(m, g);
+      });
+      c.on('close', () => { clearTimeout(timer); if (g === this.gen && this.conn === c) this.hostLost(g); });
+      c.on('error', () => {});
+    });
+  }
+
+  /* ----- 방장 ----- */
+  hostWait(slot, g) {
+    this.role = 'host'; this.phase = 'wait'; this.slot = slot % P2P_SLOTS;
+    this.members = [{ conn: null, name: this.me.name, skin: this.me.skin }];
+    this.peer.on('connection', c => {
+      c.on('data', m => { if (g === this.gen && m) this.hostData(c, m); });
+      c.on('close', () => { if (g === this.gen) this.hostLeft(c); });
+      c.on('error', () => {});
+    });
+    this.announce();
+  }
+  announce() {
+    const m = { t: 'queue', count: this.members.length, need: this.need() };
+    for (const x of this.members) if (x.conn && x.conn.open) x.conn.send(m);
+    this.emit(m);
+  }
+  hostData(c, m) {
+    if (m.t === 'join') {
+      if (this.phase !== 'wait' || this.members.length >= this.need() || this.members.some(x => x.conn === c)) { c.send({ t: 'full' }); return; }
+      const name = String(m.name || '손님').replace(/[<>&"'`\\]/g, '').slice(0, 10) || '손님';
+      this.members.push({ conn: c, name, skin: Math.max(0, Math.min(SKIN_COUNT - 1, m.skin | 0)) });
+      this.announce();
+      if (this.members.length >= this.need()) this.startGame();
+    } else if (m.t === 'fillbots') { if (this.phase === 'wait') this.startGame(); }
+    else if (m.t === 'resume') { if (this.phase === 'playing') this.resume(c, m); }
+    else if (this.phase === 'playing') {
+      const pid = this.pidOf(c);
+      if (pid < 0) return;
+      if (m.t === 'in') this.emit({ t: 'r_in', pid, dir: m.dir });
+      else if (m.t === 'bomb') this.emit({ t: 'r_bomb', pid });
+    }
+  }
+  pidOf(c) { for (const [pid, x] of this.pmap) if (x === c) return pid; return -1; }
+  hostLeft(c) {
+    if (this.phase === 'wait') {
+      const i = this.members.findIndex(x => x.conn === c);
+      if (i > 0) { this.members.splice(i, 1); this.announce(); }
+    } else if (this.phase === 'playing') {
+      const pid = this.pidOf(c);
+      if (pid >= 0) { this.pmap.delete(pid); this.emit({ t: 'peer_left', pid }); }
+    }
+  }
+
+  startGame() {
+    if (this.phase !== 'wait') return;
+    const per = MODES[this.mode].perTeam, used = new Set();
+    const pick = want => { let sk = want; if (used.has(sk)) for (let k = 0; k < SKIN_COUNT; k++) if (!used.has(k)) { sk = k; break; } used.add(sk); return sk; };
+    const teams = [[], []];
+    this.members.forEach((m, i) => teams[i % 2].push(m));
+    const defs = [], owner = [];
+    let botNo = 1;
+    for (const t of [0, 1]) for (let k = 0; k < per; k++) {
+      const m = teams[t][k];
+      defs.push({ name: m ? m.name : '봇' + botNo++, team: t, skin: pick(m ? m.skin : (used.size + 1) % SKIN_COUNT), bot: !m });
+      owner.push(m || null);
+    }
+    const hostPid = owner.findIndex(m => m && !m.conn);
+    const bots = defs.map((d, i) => (d.bot ? i : -1)).filter(i => i >= 0);
+    const seed = (Math.random() * 2 ** 31) >>> 0;
+    this.phase = 'playing'; this.defs = defs; this.myPid = hostPid; this.hostPid = hostPid;
+    this.pmap = new Map();
+    owner.forEach((m, pid) => { if (m && m.conn) this.pmap.set(pid, m.conn); });
+    for (const [pid, c] of this.pmap) c.send({ t: 'hstart', mode: this.mode, you: pid, hostPid, seed, players: defs, winsToMatch: 2, bots });
+    this.emit({ t: 'hstart', mode: this.mode, you: hostPid, hostPid, seed, players: defs, winsToMatch: 2, bots });
+  }
+
+  /* ----- 참가자 ----- */
+  onHostMsg(m, g) {
+    this.lastRecv = performance.now();
+    if (m.t === 'hstart') { this.phase = 'playing'; this.myPid = m.you; this.hostPid = m.hostPid; this.defs = m.players; }
+    else if (m.t === 'host_change') this.hostPid = m.hostPid;
+    else if (m.t === 'p2p_end') { const gg = g; this.emit(m); setTimeout(() => { if (gg === this.gen) this.hardReset(); }, 100); return; }
+    this.emit(m);
+  }
+  /** 방장이 말없이 사라졌는지 감시 (탭을 그냥 닫으면 close 이벤트가 늦게 올 수 있음) */
+  watch(g) {
+    this.lastRecv = performance.now();
+    clearInterval(this.tBeat);
+    this.tBeat = setInterval(() => {
+      if (g !== this.gen || this.role !== 'guest') return;
+      if (this.phase === 'playing' && performance.now() - this.lastRecv > 4500) this.hostLost(g);
+    }, 1000);
+  }
+  hostLost(g) {
+    if (g !== this.gen || this.role !== 'guest') return;
+    const old = this.conn; this.conn = null;
+    try { if (old) old.close(); } catch { /* 이미 닫힘 */ }
+    clearInterval(this.tBeat);
+    if (this.phase === 'wait') { this.begin(); return; }                    // 대기 중 방장이 나가면 처음부터 다시 매칭
+    if (this.phase !== 'playing') return;
+    // 승계: 남은 사람 중 번호가 빠른 순서대로 같은 방 주소를 차지
+    const oldHost = this.hostPid;
+    const humans = this.defs.map((d, i) => ({ d, i })).filter(x => !x.d.bot && x.i !== oldHost).map(x => x.i);
+    const rank = Math.max(0, humans.indexOf(this.myPid));
+    this.tMig = setTimeout(() => this.claimRoom(g), 300 + rank * 1500);
+  }
+  claimRoom(g, tries = 0) {
+    if (g !== this.gen) return;
+    try { if (this.gpeer) this.gpeer.destroy(); } catch { /* 이미 닫힘 */ }
+    this.gpeer = null;
+    let peer;
+    try { peer = new Peer(this.roomId(this.slot)); } catch { this.fail(g, '연결이 끊어졌습니다.'); return; }
+    this.peer = peer;
+    let opened = false;
+    peer.on('open', () => { if (g === this.gen) { opened = true; this.becomeHostLate(g); } });
+    peer.on('error', err => {
+      if (g !== this.gen || opened) return;
+      try { peer.destroy(); } catch { /* 이미 닫힘 */ }
+      this.peer = null;
+      if (err && err.type === 'unavailable-id') this.reconnect(g, 0); else if (tries < 3) setTimeout(() => this.claimRoom(g, tries + 1), 1000); else this.fail(g, '연결이 끊어졌습니다.');
+    });
+  }
+  becomeHostLate(g) {
+    this.role = 'host'; this.hostPid = this.myPid; this.pmap = new Map();
+    this.peer.on('connection', c => {
+      c.on('data', m => { if (g === this.gen && m) this.hostData(c, m); });
+      c.on('close', () => { if (g === this.gen) this.hostLeft(c); });
+      c.on('error', () => {});
+    });
+    this.tGrace = setTimeout(() => {                       // 재접속할 시간을 준 뒤, 못 온 사람 자리는 봇으로
+      if (g !== this.gen) return;
+      const bots = this.defs.map((d, i) => i).filter(i => i !== this.myPid && !this.pmap.has(i));
+      const msg = { t: 'host_change', hostPid: this.myPid, name: this.me.name, bots };
+      for (const c of this.pmap.values()) if (c.open) c.send(msg);
+      this.emit(msg);
+    }, 3500);
+  }
+  resume(c, m) {
+    const pid = m.pid | 0;
+    if (pid < 0 || pid >= this.defs.length || this.defs[pid].bot || pid === this.myPid) return;
+    this.pmap.set(pid, c);
+  }
+  /** 새 방장이 이미 주소를 차지했으니 그쪽으로 다시 접속 */
+  reconnect(g, tries) {
+    if (g !== this.gen) return;
+    if (tries >= 10) { this.fail(g, '연결이 끊어졌습니다.'); return; }
+    let gp = this.gpeer;
+    const go = () => {
+      const c = gp.connect(this.roomId(this.slot), { reliable: true, serialization: 'json' });
+      const bad = () => { if (g === this.gen && this.conn !== c) setTimeout(() => this.reconnect(g, tries + 1), 800); };
+      const t = setTimeout(bad, 3000);
+      c.on('open', () => {
+        clearTimeout(t); this.conn = c; this.role = 'guest'; this.lastRecv = performance.now(); this.watch(g);
+        c.send({ t: 'resume', pid: this.myPid, name: this.me.name });
+      });
+      c.on('data', m => { if (g === this.gen && m) this.onHostMsg(m, g); });
+      c.on('close', () => { clearTimeout(t); if (g === this.gen && this.conn === c) this.hostLost(g); else bad(); });
+      c.on('error', () => {});
+    };
+    if (gp && !gp.destroyed) go();
+    else { try { gp = new Peer(); } catch { this.fail(g, '연결이 끊어졌습니다.'); return; } this.gpeer = gp; gp.on('open', () => { if (g === this.gen) go(); }); gp.on('error', () => setTimeout(() => this.reconnect(g, tries + 1), 800)); }
+  }
+}
+
+/* ============================================================================
  * 7. App — 화면/흐름
  * ========================================================================== */
 class App {
@@ -730,7 +1007,9 @@ class App {
     this.offline = false;
     this.server = null;
     this.session = null;
-    this.net = new Net({ onMessage: m => this.onNet(m), onClose: () => this.onNetClosed() });
+    this.wsNet = new Net({ onMessage: m => this.onNet(m), onClose: () => this.onNetClosed() });
+    this.p2pNet = new P2PNet({ onMessage: m => this.onNet(m) });
+    this.net = this.wsNet;
     this.sfx = new Sfx();
     this.renderer = new Renderer($('game'));
     this.sig = {};
@@ -811,6 +1090,7 @@ class App {
   async openServers() {
     this.takeProfile();
     this.offline = false;
+    this.net = this.wsNet;
     this.show('servers');
     await this.refreshServers();
   }
@@ -847,7 +1127,28 @@ class App {
       li.append(left, btn);
       list.appendChild(li);
     }
-    if (!servers.length) { const li = document.createElement('li'); li.className = 'server-empty'; li.textContent = '사용 가능한 서버가 없습니다.'; list.appendChild(li); }
+    if (!servers.length) { const li = document.createElement('li'); li.className = 'server-empty'; li.textContent = '게임 서버에 연결할 수 없습니다. 아래 P2P 서버는 서버 없이 사용할 수 있습니다.'; list.appendChild(li); }
+    const head = document.createElement('li'); head.className = 'server-empty'; head.textContent = '서버 없이 접속 (P2P) — 먼저 누른 사람이 방장이 됩니다';
+    list.appendChild(head);
+    for (let n = 1; n <= 3; n++) {
+      const li = document.createElement('li'); li.className = 'server-row';
+      const left = document.createElement('div');
+      const nm = document.createElement('div'); nm.className = 'server-name'; nm.textContent = 'P2P 서버 ' + n;
+      const meta = document.createElement('div'); meta.className = 'server-meta';
+      const tag = document.createElement('span'); tag.className = 'load-tag'; tag.textContent = '서버 불필요'; meta.append(tag);
+      const btn = document.createElement('button'); btn.className = 'btn'; btn.type = 'button'; btn.textContent = '입장';
+      btn.onclick = () => this.enterP2P(n);
+      left.append(nm, meta); li.append(left, btn); list.appendChild(li);
+    }
+  }
+
+  enterP2P(n) {
+    this.sfx.unlock();
+    this.net = this.p2pNet;
+    this.p2pNet.configure(n, { name: this.name, skin: this.skin });
+    this.server = { name: 'P2P 서버 ' + n, p2p: true };
+    this.offline = false;
+    this.openLobby();
   }
 
   async enterServer(info, btn) {
@@ -896,15 +1197,17 @@ class App {
     $('btn-lobby-leave').textContent = this.offline ? '처음으로' : '서버 선택';
     $('btn-lobby-practice').classList.toggle('hidden', this.offline);
     $('btn-match').textContent = this.offline ? '연습 시작' : '게임 시작';
-    $('lobby-tabs').classList.toggle('hidden', this.offline);
-    document.querySelector('.chat').classList.toggle('hidden', this.offline);
+    const p2p = !!(this.server && this.server.p2p) && !this.offline;
+    $('lobby-tabs').classList.toggle('hidden', this.offline || p2p);
+    document.querySelector('.chat').classList.toggle('hidden', this.offline || p2p);
     $('me-name').textContent = this.name;
     $('me-sub').textContent = this.offline ? '봇과 대전합니다' : this.server.name + ' 접속중';
     skinAvatar($('me-avatar'), this.skin);
     this.markMode();
-    this.setTab(this.offline ? 'auto' : this.lobbyTab);
-    if (this.offline) {
+    this.setTab(this.offline || p2p ? 'auto' : this.lobbyTab);
+    if (this.offline || p2p) {
       this.renderLobby({ online: 1, players: [{ n: this.name, s: 0 }], hrooms: [] });
+      if (p2p) $('me-sub').textContent = this.server.name + ' · 서버 없이 접속';
     } else {
       $('chat-log').textContent = '';
       this.chat(null, `${this.server.name}에 입장했습니다. 자동 매칭을 하거나, 방 목록에서 방을 만들고 입장할 수 있습니다.`);
@@ -1068,7 +1371,7 @@ class App {
     $('matching-mode').textContent = MODES[this.mode].label;
     $('matching-count').textContent = `1 / ${MODES[this.mode].perTeam * 2}`;
     $('matching-time').textContent = '0:00';
-    $('matching-hint').textContent = '같은 서버에서 대전할 상대를 찾고 있습니다.';
+    $('matching-hint').textContent = this.server && this.server.p2p ? '먼저 누른 사람이 방장이 되고, 다음 사람이 그 방으로 들어옵니다.' : '같은 서버에서 대전할 상대를 찾고 있습니다.';
     $('btn-fillbots').classList.add('hidden');
     $('btn-cancel-match').disabled = false;
     $('matching').classList.remove('hidden');
@@ -1097,9 +1400,10 @@ class App {
     this.cleanupSession();
     this.resultShown = false;
     this.session = new OnlineSession(this, m);
-    if (this.session.relay) this.inRoom = true;
+    const p2p = !!(this.server && this.server.p2p);
+    if (this.session.relay && !p2p) this.inRoom = true;
     this.enterGame();
-    if (!this.session.relay) {                          // 전용 서버 자동 매칭: "매칭 성공!" 연출
+    if (!this.session.relay || p2p) {                          // 전용 서버 자동 매칭: "매칭 성공!" 연출
       $('matching-title').childNodes[0].textContent = '매칭 성공!';
       $('btn-fillbots').classList.add('hidden');
       $('btn-cancel-match').disabled = true;
@@ -1114,6 +1418,7 @@ class App {
     $('banner').classList.add('hidden');
     $('btn-rematch').classList.toggle('hidden', this.session.online);
     $('result-hint').classList.add('hidden');
+    $('result-hint').textContent = this.server && this.server.p2p ? '잠시 후 로비로 돌아갑니다.' : '잠시 후 대기방으로 돌아갑니다.';
     $('btn-result-exit').textContent = this.session.relay ? '나가기' : '로비로';
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
     this.show('game');
@@ -1162,6 +1467,7 @@ class App {
       case 'queue': $('matching-count').textContent = `${m.count} / ${m.need}`; break;
       case 'start': case 'hstart': this.startOnline(m); break;
       case 'room': this.onRoom(m); break;
+      case 'p2p_end': this.cleanupSession(); $('result').classList.add('hidden'); this.openLobby(); break;
       case 'room_closed': {
         const relay = this.inRoom || (this.session && this.session.relay);
         this.cleanupSession();
